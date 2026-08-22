@@ -26,6 +26,9 @@ For broad integrations or audits, delegate independent read-only tasks such as c
 7. **Prefer a prebuilt integration when one exists.** Shopify → a Paymob app; WooCommerce/Magento/Odoo/OpenCart/PrestaShop/… → Paymob's official plugin. Only hand-code for custom/headless checkouts.
 8. **Every live write needs current, specific authorization.** Obtain explicit confirmation for the current account, test/live mode, operation, target, amount, and currency; never reuse blanket approval. Read remote state first and keep a stable operation fingerprint/merchant reference.
 9. **Never auto-retry an ambiguous financial write.** After a timeout or unclear response, query Paymob to determine whether it succeeded before retrying. Verify and report the remote result after every write.
+10. **Derive payment facts server-side.** The browser may send an authenticated opaque checkout/order identifier only. Load and lock the order, then derive amount, currency, items, Integration IDs, tenant/account, and fulfillment target from trusted storage.
+11. **Bind every verified callback to the stored attempt.** HMAC proves Paymob sent the callback; before marking paid, also match amount, currency, Integration ID, owner/account, mode, merchant reference, and known provider IDs. Auth-only, pending, failed, voided, and refunded events never trigger new fulfillment.
+12. **Never log raw payment payloads or secrets.** Use allowlisted, redacted structured logs only. Protect checkout/status routes with normal authentication, ownership, rate-limit, and CSRF controls; exempt only the Paymob webhook from CSRF.
 
 ## Regional base URLs
 
@@ -36,11 +39,13 @@ For broad integrations or audits, delegate independent read-only tasks such as c
 | KSA    | `https://ksa.paymob.com` |
 | UAE    | `https://uae.paymob.com` |
 
-Default to Egypt unless the user specifies a region. Use **test-mode** keys with **test-mode** Integration IDs against the production base URL for sandbox testing (mismatched modes return 404 on intention creation).
+Egypt may be used as an explicit tutorial default, but require the merchant's region before production code or live configuration. Use **test-mode** keys with **test-mode** Integration IDs against the regional base URL for sandbox testing (mismatched modes return 404 on intention creation).
 
 ## Credentials the user provides (from the Paymob dashboard)
 
-`PAYMOB_SECRET_KEY` (server only) · `PAYMOB_PUBLIC_KEY` (frontend-safe) · `PAYMOB_HMAC_SECRET` (webhook validation) · `PAYMOB_API_KEY` (Transaction Inquiry only) · `PAYMOB_INTEGRATION_ID_*` (one per payment method) · `PAYMOB_BASE_URL` (region).
+`PAYMOB_REGION` · `PAYMOB_MODE` · `PAYMOB_SECRET_KEY` (server only) · `PAYMOB_PUBLIC_KEY` (frontend-safe) · `PAYMOB_HMAC_SECRET` (webhook validation) · `PAYMOB_API_KEY` (Transaction Inquiry only) · `PAYMOB_INTEGRATION_ID_*` (one per payment method) · `PAYMOB_BASE_URL` (derived from region).
+
+Guide the user with `skills/paymob-integration/references/credentials-and-integration-ids.md`; never ask them to paste a key into an AI conversation.
 
 ---
 

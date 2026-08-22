@@ -5,6 +5,8 @@ Clean, correct reference (Intention API + Unified Checkout + HMAC-verified webho
 ## Environment
 
 ```env
+PAYMOB_REGION=egypt
+PAYMOB_MODE=test
 PAYMOB_BASE_URL=https://accept.paymob.com
 PAYMOB_SECRET_KEY=sk_test_xxxxxxxx
 PAYMOB_PUBLIC_KEY=pk_test_xxxxxxxx
@@ -23,13 +25,27 @@ require "uri"
 
 class Paymob
   def initialize
-    @base   = (ENV["PAYMOB_BASE_URL"] || "https://accept.paymob.com").chomp("/")
+    bases = { "egypt" => "https://accept.paymob.com", "uae" => "https://uae.paymob.com",
+              "ksa" => "https://ksa.paymob.com", "oman" => "https://oman.paymob.com" }
+    region = ENV.fetch("PAYMOB_REGION").downcase
+    mode = ENV.fetch("PAYMOB_MODE").downcase
+    raise "Invalid Paymob region or mode" unless bases.key?(region) && %w[test live].include?(mode)
+    @base = bases.fetch(region)
+    raise "PAYMOB_BASE_URL does not match PAYMOB_REGION" unless ENV.fetch("PAYMOB_BASE_URL").chomp("/") == @base
     @secret = ENV.fetch("PAYMOB_SECRET_KEY")
     @public = ENV.fetch("PAYMOB_PUBLIC_KEY")
     @hmac   = ENV.fetch("PAYMOB_HMAC_SECRET")
+    raise "Missing or placeholder Paymob configuration" if [@secret, @public, @hmac].any? { |value|
+      value.empty? || value.match?(/xxxxx|changeme|replace_me|your_|example/i)
+    }
+    [@secret, @public].each do |credential|
+      match = credential.match(/(?:^|_)(test|live)_/i)
+      key_mode = match && match[1].downcase
+      raise "Paymob key mode mismatch" if key_mode && key_mode != mode
+    end
   end
 
-  def create_intention(amount_cents:, currency:, payment_methods:, special_reference:, customer:, items: [])
+  def create_intention(amount_cents:, currency:, payment_methods:, special_reference:, customer:, billing_country:, items: [])
     payload = {
       amount: amount_cents,
       currency: currency,
@@ -40,7 +56,7 @@ class Paymob
         first_name: customer[:first_name], last_name: customer[:last_name],
         email: customer[:email], phone_number: customer[:phone], # REQUIRED
         apartment: "NA", floor: "NA", street: "NA", building: "NA",
-        shipping_method: "NA", postal_code: "NA", city: "NA", state: "NA", country: "EGY"
+        shipping_method: "NA", postal_code: "NA", city: "NA", state: "NA", country: billing_country
       },
       customer: { first_name: customer[:first_name], last_name: customer[:last_name], email: customer[:email] },
       notification_url: "#{ENV['APP_URL']}/api/paymob/webhook",
@@ -55,31 +71,22 @@ class Paymob
   end
 
   def verify_transaction_post_hmac(obj, received_hmac)
+    return false unless received_hmac.to_s.match?(/\A[0-9a-fA-F]{128}\z/)
     fields = [
-      obj["amount_cents"], obj["created_at"], obj["currency"], obj["error_occured"],
-      obj["has_parent_transaction"], obj["id"], obj["integration_id"], obj["is_3d_secure"],
-      obj["is_auth"], obj["is_capture"], obj["is_refunded"], obj["is_standalone_payment"],
-      obj["is_voided"], obj.dig("order", "id"), obj["owner"], obj["pending"],
-      obj.dig("source_data", "pan"), obj.dig("source_data", "sub_type"),
-      obj.dig("source_data", "type"), obj["success"]
+      obj.fetch("amount_cents"), obj.fetch("created_at"), obj.fetch("currency"), obj.fetch("error_occured"),
+      obj.fetch("has_parent_transaction"), obj.fetch("id"), obj.fetch("integration_id"), obj.fetch("is_3d_secure"),
+      obj.fetch("is_auth"), obj.fetch("is_capture"), obj.fetch("is_refunded"), obj.fetch("is_standalone_payment"),
+      obj.fetch("is_voided"), obj.fetch("order").fetch("id"), obj.fetch("owner"), obj.fetch("pending"),
+      obj.fetch("source_data").fetch("pan"), obj.fetch("source_data").fetch("sub_type"),
+      obj.fetch("source_data").fetch("type"), obj.fetch("success")
     ]
-    concat   = fields.map { |v| bool_str(v) }.join
-    computed = OpenSSL::HMAC.hexdigest("SHA512", @hmac, concat)
-    # timing-safe
-    return false unless computed.bytesize == received_hmac.to_s.bytesize
-    OpenSSL.fixed_length_secure_compare(computed, received_hmac.to_s)
-  end
-
-  def refund(transaction_id, amount_cents)
-    post("/api/acceptance/void_refund/refund", transaction_id: transaction_id, amount_cents: amount_cents)
-  end
-
-  def void(transaction_id)
-    post("/api/acceptance/void_refund/void", transaction_id: transaction_id)
-  end
-
-  def capture(transaction_id, amount_cents)
-    post("/api/acceptance/capture", transaction_id: transaction_id, amount_cents: amount_cents)
+    return false if fields.any?(&:nil?)
+    concat = fields.map { |v| bool_str(v) }.join
+    computed = [OpenSSL::HMAC.hexdigest("SHA512", @hmac, concat)].pack("H*")
+    received = [received_hmac].pack("H*")
+    OpenSSL.fixed_length_secure_compare(computed, received)
+  rescue KeyError, TypeError
+    false
   end
 
   private
@@ -105,6 +112,8 @@ class Paymob
 end
 ```
 
+Keep refund/void/capture out of the basic checkout client. If required, implement the controlled application service described in `advanced-features.md` and `integration-safety.md`.
+
 ## Rails controller
 
 ```ruby
@@ -113,47 +122,78 @@ end
 #   post "/api/paymob/webhook",  to: "payments#webhook"
 
 class PaymentsController < ApplicationController
-  skip_before_action :verify_authenticity_token, only: [:webhook, :checkout]
+  skip_before_action :verify_authenticity_token, only: [:webhook]
+  before_action :authenticate_user!, only: [:checkout]
 
   def checkout
+    unless request.media_type == "application/json"
+      return render json: { error: "JSON required" }, status: :unsupported_media_type
+    end
+    checkout_session_id = params[:checkoutSessionId]
+    unless checkout_session_id.is_a?(String) && checkout_session_id.present? && checkout_session_id.bytesize <= 200
+      return render json: { error: "Invalid checkout session" }, status: :bad_request
+    end
     paymob = Paymob.new
-    intention = paymob.create_intention(
-      amount_cents: (params[:amount].to_f * 100).round,
-      currency: "EGP",
-      payment_methods: [ENV["PAYMOB_INTEGRATION_ID_CARD"].to_i],
-      special_reference: params[:order_id].to_s,
-      customer: { first_name: params[:first_name] || "NA", last_name: params[:last_name] || "NA",
-                  email: params[:email], phone: params[:phone] },
-      items: []
+    attempt = CheckoutStore.prepare_attempt!(
+      checkout_session_id: checkout_session_id,
+      customer_id: current_user.id
     )
-    render json: { checkout_url: paymob.checkout_url(intention[:client_secret]) }
+    intention = paymob.create_intention(
+      amount_cents: attempt.amount_cents,
+      currency: attempt.currency,
+      payment_methods: attempt.payment_methods,
+      special_reference: attempt.reference,
+      customer: attempt.customer,
+      billing_country: attempt.billing_country,
+      items: attempt.items
+    )
+    CheckoutStore.attach_paymob_intention!(attempt.id, intention[:id])
+    render json: {
+      checkout_url: paymob.checkout_url(intention[:client_secret]),
+      checkoutAttemptToken: attempt.status_token
+    }
   end
 
   def webhook
+    unless request.media_type == "application/json"
+      return render json: { error: "JSON required" }, status: :unsupported_media_type
+    end
+    if request.content_length.to_i > 65_536
+      return render json: { error: "Payload too large" }, status: :payload_too_large
+    end
     paymob   = Paymob.new
-    obj      = params[:obj] || {}
-    received = params[:hmac].to_s
-    unless paymob.verify_transaction_post_hmac(obj.as_json, received)
+    obj_params = params[:obj]
+    unless obj_params.is_a?(ActionController::Parameters)
+      return render json: { error: "Invalid obj" }, status: :bad_request
+    end
+    obj = obj_params.to_unsafe_h
+    received = params[:hmac]
+    unless received.is_a?(String)
+      return render json: { error: "One HMAC value required" }, status: :bad_request
+    end
+    unless paymob.verify_transaction_post_hmac(obj, received)
       return render json: { error: "Invalid HMAC" }, status: :unauthorized
     end
-    if obj["success"] && !obj["pending"]
-      PaymobPaymentEventStore.record_successful_event!(
-        provider_event_id: obj["id"].to_s,
-        paymob_order_id: obj.dig("order", "id").to_s,
-        merchant_order_id: obj.dig("order", "merchant_order_id").to_s
-      )
-    end
+    PaymobPaymentEventStore.record_verified_event!(
+      provider_event_id: obj["id"].to_s,
+      paymob_order_id: obj.dig("order", "id").to_s,
+      merchant_order_id: obj.dig("order", "merchant_order_id").to_s,
+      amount_cents: obj["amount_cents"].to_i,
+      currency: obj["currency"].to_s,
+      integration_id: obj["integration_id"].to_i,
+      owner: obj["owner"].to_s,
+      classification: PaymobTransactionState.classify(obj)
+    )
     render json: { received: true }
   end
 end
 ```
 
-`PaymobPaymentEventStore.record_successful_event!` is a required persistence adapter. In one database transaction it must insert a UNIQUE provider event keyed by `obj["id"]`, compare-and-set the order state, and insert a UNIQUE fulfillment outbox row. The bang method must raise on failure so Rails returns non-2xx; only the outbox worker fulfills.
+The adapters and `PaymobTransactionState.classify` are required application boundaries. Follow `integration-safety.md`: bind the verified event to the stored attempt, commit a binding mismatch as a quarantined no-op, insert a UNIQUE provider event keyed by `obj["id"]`, apply the ordered lifecycle classifier and compare-and-set, and insert a UNIQUE fulfillment outbox row only for a completed sale/capture. The bang method must raise only when the atomic persistence transaction fails so Rails returns non-2xx. Enforce the same 64 KiB webhook limit at the web server/proxy for chunked requests. Return status through an authenticated, ownership-checked endpoint using `status_token`.
 
 ## Gotchas
 
-## Gotchas
-
-- Header `Authorization: Token <secret>` (not Bearer). Amount in **cents**. `phone_number` required.
+- Header `Authorization: Token <secret>` (not Bearer). Derive amount/items/currency/Integration IDs server-side. `phone_number` is required.
 - Booleans concatenate as `true`/`false` (Ruby's `to_s` already does this; `bool_str` guards `nil`).
 - Use `OpenSSL.fixed_length_secure_compare` (timing-safe). Verify HMAC before trusting `success`; never trust redirect params. `client_secret` is single-use.
+- Validate the exact Paymob origin before attaching the Secret Key, and emit redacted structured logs only.

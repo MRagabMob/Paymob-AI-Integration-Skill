@@ -7,6 +7,8 @@ Clean, correct reference (Intention API + Unified Checkout + HMAC-verified webho
 ```json
 {
   "Paymob": {
+    "Region": "egypt",
+    "Mode": "test",
     "BaseUrl": "https://accept.paymob.com",
     "SecretKey": "sk_test_xxxxxxxx",
     "PublicKey": "pk_test_xxxxxxxx",
@@ -20,13 +22,18 @@ Clean, correct reference (Intention API + Unified Checkout + HMAC-verified webho
 ## Service (`PaymobService.cs`)
 
 ```csharp
+using System.Collections.Generic;
+using System.Linq;
+using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
 public class PaymobOptions
 {
-    public string BaseUrl { get; set; } = "https://accept.paymob.com";
+    public string Region { get; set; } = "";
+    public string Mode { get; set; } = "";
+    public string BaseUrl { get; set; } = "";
     public string SecretKey { get; set; } = "";
     public string PublicKey { get; set; } = "";
     public string HmacSecret { get; set; } = "";
@@ -45,14 +52,41 @@ public class PaymobService
     {
         _o = options;
         _http = http;
-        _http.BaseAddress = new Uri(_o.BaseUrl.TrimEnd('/') + "/");
+        var bases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["egypt"] = "https://accept.paymob.com", ["uae"] = "https://uae.paymob.com",
+            ["ksa"] = "https://ksa.paymob.com", ["oman"] = "https://oman.paymob.com"
+        };
+        var mode = _o.Mode.ToLowerInvariant();
+        if (!bases.TryGetValue(_o.Region, out var origin)
+            || (mode != "test" && mode != "live"))
+            throw new InvalidOperationException("Invalid Paymob region or mode");
+        if (_o.BaseUrl.TrimEnd('/') != origin)
+            throw new InvalidOperationException("PAYMOB_BASE_URL does not match PAYMOB_REGION");
+        if (string.IsNullOrWhiteSpace(_o.SecretKey) || string.IsNullOrWhiteSpace(_o.PublicKey)
+            || string.IsNullOrWhiteSpace(_o.HmacSecret)
+            || new[] { _o.SecretKey, _o.PublicKey, _o.HmacSecret }.Any(value =>
+                System.Text.RegularExpressions.Regex.IsMatch(value,
+                    "xxxxx|changeme|replace_me|your_|example",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase)))
+            throw new InvalidOperationException("Missing or placeholder Paymob configuration");
+        foreach (var credential in new[] { _o.SecretKey, _o.PublicKey })
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(
+                credential, "(?:^|_)(test|live)_",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (match.Success && !string.Equals(match.Groups[1].Value, mode,
+                    StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Paymob key mode mismatch");
+        }
+        _http.BaseAddress = new Uri(origin + "/");
         // literal scheme "Token", not "Bearer"
         _http.DefaultRequestHeaders.Add("Authorization", $"Token {_o.SecretKey}");
     }
 
     public async Task<(long Id, string ClientSecret)> CreateIntentionAsync(
         long amountCents, string currency, int[] paymentMethods,
-        string specialReference, CustomerInfo c)
+        string specialReference, string billingCountry, CustomerInfo c)
     {
         var payload = new
         {
@@ -67,7 +101,7 @@ public class PaymobService
                 phone_number = c.Phone,                 // REQUIRED
                 apartment = "NA", floor = "NA", street = "NA", building = "NA",
                 shipping_method = "NA", postal_code = "NA", city = "NA",
-                state = "NA", country = "EGY"
+                state = "NA", country = billingCountry
             },
             customer = new { first_name = c.FirstName, last_name = c.LastName, email = c.Email },
             notification_url = $"{_o.AppUrl}/api/paymob/webhook",
@@ -88,22 +122,29 @@ public class PaymobService
     // Transaction HMAC for the POST webhook. `obj` is the parsed body.obj element.
     public bool VerifyTransactionPostHmac(JsonElement obj, string receivedHmac)
     {
-        string[] fields =
+        if (string.IsNullOrWhiteSpace(_o.HmacSecret)
+            || !System.Text.RegularExpressions.Regex.IsMatch(receivedHmac ?? "", "^[0-9a-fA-F]{128}$"))
+            return false;
+        try
         {
-            Raw(obj, "amount_cents"), Raw(obj, "created_at"), Raw(obj, "currency"),
-            Raw(obj, "error_occured"), Raw(obj, "has_parent_transaction"), Raw(obj, "id"),
-            Raw(obj, "integration_id"), Raw(obj, "is_3d_secure"), Raw(obj, "is_auth"),
-            Raw(obj, "is_capture"), Raw(obj, "is_refunded"), Raw(obj, "is_standalone_payment"),
-            Raw(obj, "is_voided"), Raw(obj.GetProperty("order"), "id"), Raw(obj, "owner"),
-            Raw(obj, "pending"), Raw(obj.GetProperty("source_data"), "pan"),
-            Raw(obj.GetProperty("source_data"), "sub_type"),
-            Raw(obj.GetProperty("source_data"), "type"), Raw(obj, "success")
-        };
-        var concat = string.Concat(fields);
-        using var h = new HMACSHA512(Encoding.UTF8.GetBytes(_o.HmacSecret));
-        var computed = Convert.ToHexString(h.ComputeHash(Encoding.UTF8.GetBytes(concat))).ToLowerInvariant();
-        return CryptographicOperations.FixedTimeEquals(
-            Encoding.UTF8.GetBytes(computed), Encoding.UTF8.GetBytes(receivedHmac ?? ""));
+            string[] fields =
+            {
+                Raw(obj, "amount_cents"), Raw(obj, "created_at"), Raw(obj, "currency"),
+                Raw(obj, "error_occured"), Raw(obj, "has_parent_transaction"), Raw(obj, "id"),
+                Raw(obj, "integration_id"), Raw(obj, "is_3d_secure"), Raw(obj, "is_auth"),
+                Raw(obj, "is_capture"), Raw(obj, "is_refunded"), Raw(obj, "is_standalone_payment"),
+                Raw(obj, "is_voided"), Raw(obj.GetProperty("order"), "id"), Raw(obj, "owner"),
+                Raw(obj, "pending"), Raw(obj.GetProperty("source_data"), "pan"),
+                Raw(obj.GetProperty("source_data"), "sub_type"),
+                Raw(obj.GetProperty("source_data"), "type"), Raw(obj, "success")
+            };
+            using var h = new HMACSHA512(Encoding.UTF8.GetBytes(_o.HmacSecret));
+            var computed = h.ComputeHash(Encoding.UTF8.GetBytes(string.Concat(fields)));
+            return CryptographicOperations.FixedTimeEquals(computed, Convert.FromHexString(receivedHmac));
+        }
+        catch (KeyNotFoundException) { return false; }
+        catch (InvalidOperationException) { return false; }
+        catch (FormatException) { return false; }
     }
 
     // Emit each value exactly as it appears in JSON: booleans as true/false, numbers unquoted, strings raw.
@@ -115,66 +156,93 @@ public class PaymobService
             JsonValueKind.True => "true",
             JsonValueKind.False => "false",
             JsonValueKind.String => el.GetString() ?? "",
+            JsonValueKind.Null or JsonValueKind.Undefined =>
+                throw new InvalidOperationException("Missing HMAC field"),
             _ => el.GetRawText()
         };
     }
-
-    public Task<HttpResponseMessage> Refund(long txnId, long amountCents) =>
-        _http.PostAsJsonAsync("api/acceptance/void_refund/refund",
-            new { transaction_id = txnId, amount_cents = amountCents });
-    public Task<HttpResponseMessage> Void(long txnId) =>
-        _http.PostAsJsonAsync("api/acceptance/void_refund/void", new { transaction_id = txnId });
-    public Task<HttpResponseMessage> Capture(long txnId, long amountCents) =>
-        _http.PostAsJsonAsync("api/acceptance/capture",
-            new { transaction_id = txnId, amount_cents = amountCents });
 }
 ```
 
 > **Boolean handling:** the `Raw` helper emits `true`/`false` (not `True`/`False`) and unquoted numbers, matching exactly what Paymob concatenated to produce the HMAC.
 
+Keep refund/void/capture out of the basic checkout client. If required, implement the controlled application service described in `advanced-features.md` and `integration-safety.md`.
+
 ## Minimal-API endpoints (`Program.cs`)
 
 ```csharp
-app.MapPost("/api/checkout", async (CheckoutDto dto, PaymobService paymob, PaymobOptions o) =>
+using System.Security.Claims;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+
+app.MapPost("/api/checkout", async (CheckoutRequest dto, ClaimsPrincipal user,
+    PaymobService paymob, ICheckoutStore checkoutStore) =>
 {
-    var (_, clientSecret) = await paymob.CreateIntentionAsync(
-        amountCents: (long)Math.Round(dto.Amount * 100),
-        currency: "EGP",
-        paymentMethods: new[] { o.IntegrationIdCard },
-        specialReference: dto.OrderId,
-        c: new CustomerInfo(dto.FirstName, dto.LastName, dto.Email, dto.Phone));
-    return Results.Ok(new { checkoutUrl = paymob.CheckoutUrl(clientSecret) });
-});
+    if (string.IsNullOrWhiteSpace(dto.CheckoutSessionId) || dto.CheckoutSessionId.Length > 200)
+        return Results.BadRequest(new { error = "Invalid checkout session" });
+    var attempt = await checkoutStore.PrepareAttemptAsync(dto.CheckoutSessionId,
+        user.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    var (intentionId, clientSecret) = await paymob.CreateIntentionAsync(
+        amountCents: attempt.AmountCents,
+        currency: attempt.Currency,
+        paymentMethods: attempt.PaymentMethods,
+        specialReference: attempt.Reference,
+        billingCountry: attempt.BillingCountry,
+        c: attempt.Customer);
+    await checkoutStore.AttachPaymobIntentionAsync(attempt.Id, intentionId);
+    return Results.Ok(new {
+        checkoutUrl = paymob.CheckoutUrl(clientSecret),
+        checkoutAttemptToken = attempt.StatusToken
+    });
+}).RequireAuthorization();
 
 app.MapPost("/api/paymob/webhook", async (HttpRequest req, PaymobService paymob, IPaymobPaymentEventStore paymentStore) =>
 {
-    using var doc = await JsonDocument.ParseAsync(req.Body);
+    if (!req.HasJsonContentType())
+        return Results.Json(new { error = "JSON required" }, statusCode: 415);
+    if (req.ContentLength > 65536)
+        return Results.Json(new { error = "Payload too large" }, statusCode: 413);
+    JsonDocument doc;
+    try { doc = await JsonDocument.ParseAsync(req.Body); }
+    catch (JsonException) { return Results.BadRequest(new { error = "Invalid JSON" }); }
+    using (doc)
+    {
+    if (doc.RootElement.ValueKind != JsonValueKind.Object)
+        return Results.BadRequest(new { error = "Invalid payload" });
     if (!doc.RootElement.TryGetProperty("obj", out var obj))
         return Results.Json(new { error = "no obj" }, statusCode: 400);
+    if (obj.ValueKind != JsonValueKind.Object)
+        return Results.BadRequest(new { error = "Invalid obj" });
 
-    var received = req.Query["hmac"].ToString();
+    if (!req.Query.TryGetValue("hmac", out var receivedValues) || receivedValues.Count != 1)
+        return Results.BadRequest(new { error = "One HMAC value required" });
+    var received = receivedValues[0]!;
     if (!paymob.VerifyTransactionPostHmac(obj, received))
         return Results.Json(new { error = "Invalid HMAC" }, statusCode: 401);
 
-    if (obj.GetProperty("success").GetBoolean() && !obj.GetProperty("pending").GetBoolean())
-    {
-        await paymentStore.RecordSuccessfulEventAsync(
-            providerEventId: obj.GetProperty("id").ToString(),
-            paymobOrderId: obj.GetProperty("order").GetProperty("id").ToString(),
-            merchantOrderId: obj.GetProperty("order").GetProperty("merchant_order_id").ToString());
-    }
+    await paymentStore.RecordVerifiedEventAsync(
+        providerEventId: obj.GetProperty("id").ToString(),
+        paymobOrderId: obj.GetProperty("order").GetProperty("id").ToString(),
+        merchantOrderId: obj.GetProperty("order").GetProperty("merchant_order_id").ToString(),
+        amountCents: obj.GetProperty("amount_cents").GetInt64(),
+        currency: obj.GetProperty("currency").GetString()!,
+        integrationId: obj.GetProperty("integration_id").GetInt64(),
+        owner: obj.GetProperty("owner").ToString(),
+        classification: PaymobTransactionState.Classify(obj));
     return Results.Ok(new { received = true });
-});
+    }
+}).WithMetadata(new RequestSizeLimitAttribute(65536));
 
-record CheckoutDto(decimal Amount, string OrderId, string FirstName, string LastName, string Email, string Phone);
+record CheckoutRequest(string CheckoutSessionId);
 ```
 
-`IPaymobPaymentEventStore.RecordSuccessfulEventAsync` is a required persistence adapter. In one database transaction it must insert a UNIQUE provider event keyed by `obj.id`, compare-and-set the order state, and insert a UNIQUE fulfillment outbox row. Let failures propagate to non-2xx; only the outbox worker fulfills.
+The adapters and `PaymobTransactionState.Classify` are required application boundaries. Follow `integration-safety.md`: bind the verified event to the stored attempt, commit a binding mismatch as a quarantined no-op, insert a UNIQUE provider event keyed by `obj.id`, apply the ordered lifecycle classifier and compare-and-set, and insert a UNIQUE fulfillment outbox row only for a completed sale/capture. Throw only when the atomic persistence transaction fails. Return status through an authenticated, ownership-checked endpoint using `StatusToken`.
 
-Register in DI: `builder.Services.AddSingleton(paymobOptions); builder.Services.AddHttpClient<PaymobService>(); builder.Services.AddScoped<IPaymobPaymentEventStore, PaymobPaymentEventStore>();`
+Register in DI: `builder.Services.AddSingleton(paymobOptions); builder.Services.AddHttpClient<PaymobService>(); builder.Services.AddScoped<ICheckoutStore, CheckoutStore>(); builder.Services.AddScoped<IPaymobPaymentEventStore, PaymobPaymentEventStore>();`
 
 ## Gotchas
 
-- Header scheme is `Token` (not `Bearer`). Amount in **cents**. `phone_number` required.
+- Header scheme is `Token` (not `Bearer`). Derive amount/items/currency/Integration IDs server-side. `phone_number` is required.
 - Concatenate booleans as lowercase `true`/`false` (the `Raw` helper does this).
 - Use `CryptographicOperations.FixedTimeEquals` (timing-safe). Verify HMAC before trusting `success`; never trust redirect params. `client_secret` is single-use.
+- Validate the exact Paymob origin before attaching the Secret Key, and emit redacted structured logs only.

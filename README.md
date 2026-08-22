@@ -1,6 +1,6 @@
 # Paymob Integration Skill for AI Agents
 
-![version](https://img.shields.io/badge/version-3.3.0-blue)
+![version](https://img.shields.io/badge/version-3.4.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![works with](https://img.shields.io/badge/works%20with-Claude%20%C2%B7%20Lovable%20%C2%B7%20Cursor%20%C2%B7%20Windsurf%20%C2%B7%20Copilot%20%C2%B7%20Codex-8A2BE2)
 ![regions](https://img.shields.io/badge/regions-EGY%20%C2%B7%20UAE%20%C2%B7%20KSA%20%C2%B7%20OMN-orange)
@@ -36,7 +36,7 @@ The agent fetches the skill and puts it wherever its own convention expects. Tes
 | Agent | What you get |
 |---|---|
 | **OpenAI Codex** | Uses its `$skill-installer`; installs to `~/.codex/skills/paymob-integration` |
-| **Claude Code** | Installs as a personal skill in `~/.claude/skills/paymob-integration/`, plus the three slash commands in `~/.claude/commands/` |
+| **Claude Code** | Installs as a personal skill in `~/.claude/skills/paymob-integration/`, plus the slash commands in `~/.claude/commands/` |
 
 **Keep the `/tree/main/skills/paymob-integration` part of the URL.** The repository root is a multi-agent plugin package, not a standalone skill directory — an agent pointed at the bare root can install the wrong tree.
 
@@ -77,9 +77,11 @@ Listed at **[cursor.directory/plugins/paymob-integration](https://cursor.directo
 |---|---|
 | **Skill** `paymob-integration` | The full integration guidance |
 | **MCP Server** `paymob` | Live account access — payment links, transactions, balances, settlements |
-| **Commands** ×3 | `/paymob-test-cards`, `/paymob-explain-error`, `/paymob-check-hmac` |
+| **Commands** ×5 | `/paymob-setup-check`, `/paymob-sandbox-check`, `/paymob-test-cards`, `/paymob-explain-error`, `/paymob-check-hmac` |
 
-The three commands read the skill's reference files at run time, so install the **Skill** component alongside them — on its own, a command will correctly refuse to answer rather than guess at a field order it cannot read.
+The commands read the skill's reference files at run time, so install the **Skill** component alongside them — on its own, a command will correctly refuse to answer rather than guess.
+
+**Event quickstart:** install the Skill and Commands components, start a fresh Cursor chat, ask Cursor to use the Paymob skill, then run `/paymob-setup-check`. Resolve every `FAIL` before running `/paymob-sandbox-check`. Both checks are designed to use existing local configuration without displaying secret values.
 
 ### 5. Coding agents → drop in `AGENTS.md`
 
@@ -134,16 +136,16 @@ Cowork and local-development options are under [Installation](#installation).
 When you ask the agent for help integrating Paymob, it provides:
 
 - **Platform routing first** — detects Shopify, an official e-commerce plugin platform (WooCommerce, Magento, Odoo, OpenCart, PrestaShop, …), or a custom build, and steers you to the fastest correct path instead of hand-coding when a prebuilt integration already exists.
-- **Guided onboarding** — merchant-status check, dashboard credential collection, and sandbox-first testing before go-live.
+- **Guided onboarding** — canonical dashboard paths, a secret-safe setup checker, and staged sandbox testing before go-live.
 - **Complete Intention API knowledge** — the only official payment-creation flow, with Unified Checkout (redirect) and the Pixel SDK (embedded).
 - **Native Mobile SDK flow** — iOS / Android / Flutter / React Native, keeping the Secret Key off the device.
-- **Corrected, copy-ready code in your stack** — Node.js/TypeScript/NestJS, Python/Django/Flask/FastAPI, PHP/Laravel, .NET/C#, Ruby/Rails, and React/Next.js/Vue.
+- **Corrected, copy-ready code in your stack** — Node.js/TypeScript/NestJS, Python/Django/Flask/FastAPI, PHP/Laravel, .NET/C#, Ruby/Rails, and React/Next.js/Vue, with server-derived payment facts and callback-to-attempt binding.
 - **All 3 HMAC types** — transaction, card token, and subscription — with exact field orders, SHA-512, and timing-safe comparison.
 - **Reconciliation** — a Transaction Inquiry fallback for callbacks that never arrive, stuck "pending" orders, and admin lookups.
 - **Core & advanced features** — subscriptions, saved cards (CIT/MIT), Auth/Capture, refund/void, split features, convenience fees.
 - **Live-doc discipline** — points at Paymob's `llms.txt` index, developer docs, Integration Wizard, and community forum so the agent can confirm anything that may have changed.
 - **Safe multi-agent execution** — separates codebase mapping, live-doc verification, and security review while keeping file edits and all live payment actions serialized through one primary agent.
-- **Slash commands** (Claude Code / Cowork) — `/paymob-test-cards`, `/paymob-explain-error`, and `/paymob-check-hmac` for direct access to sandbox credentials, error lookups, and a webhook HMAC audit. See [Commands](#commands-claude-code--cowork).
+- **Slash commands** (Claude Code / Cowork) — setup preflight, staged sandbox diagnosis, test credentials, error lookup, and webhook HMAC audit. See [Commands](#commands-claude-code--cowork).
 
 ---
 
@@ -178,6 +180,8 @@ Once the plugin is installed, these slash commands give direct access to the mos
 
 | Command | What it does |
 |---|---|
+| `/paymob-setup-check [project path]` | Runs a local, secret-safe configuration preflight. It reports only pass/fail/warn and variable names; it never prints values or calls Paymob. |
+| `/paymob-sandbox-check [project path or stage]` | Diagnoses the sandbox flow in order—setup, intention, checkout, callback, HMAC, business binding, lifecycle, and reconciliation—and stops at the first failing stage. |
 | `/paymob-test-cards [card\|wallet\|kiosk\|bnpl]` | Prints sandbox test cards, wallet numbers, and OTPs from `references/test-credentials.md`, optionally filtered to one method. Always notes the 30-day sandbox expiry and that decline/error simulation isn't officially documented. For kiosk and BNPL it reports that sandbox can't test them at all, rather than offering a card as a stand-in. |
 | `/paymob-explain-error <code, status, or message>` | Looks up a Paymob error against the Troubleshooting table in `SKILL.md`, explains the cause, and — for code fixes — pulls the corrected snippet from the matching `references/code-*.md` file for your stack. Falls back to `references/live-resources.md` for anything not in the table instead of guessing. |
 | `/paymob-check-hmac [path]` | Statically audits your webhook HMAC verification against `references/hmac-verification.md`: SHA-512 (not SHA-256), exact field order, `body.obj` sourcing, no `obj.id`/`obj.order.id` mix-up, fail-closed behavior, and unique-constraint-backed idempotency. Never asks you to paste your HMAC secret or API key; only invoked manually, never automatically. |
@@ -185,6 +189,8 @@ Once the plugin is installed, these slash commands give direct access to the mos
 **Examples:**
 
 ```text
+/paymob-setup-check
+/paymob-sandbox-check webhook
 /paymob-test-cards wallet
 /paymob-explain-error 401 on intention create
 /paymob-explain-error HMAC mismatch
@@ -197,7 +203,7 @@ Once the plugin is installed, these slash commands give direct access to the mos
 
 ### Skill upload (Claude.ai / ChatGPT / Lovable)
 
-**Recommended:** download the permanent release asset and upload it directly—do not extract it:
+**Recommended:** download the permanent release asset and upload it directly—do not extract it. Releases also include `paymob-integration.zip.sha256` for integrity verification:
 
 [`paymob-integration.zip`](https://github.com/PaymobAccept/Paymob-AI-Integration-Skill/releases/latest/download/paymob-integration.zip)
 
@@ -216,6 +222,7 @@ paymob-integration.zip
 └── paymob-integration/
     ├── SKILL.md
     ├── agents/
+    ├── scripts/
     └── references/
 ```
 
@@ -262,7 +269,7 @@ Add `PaymobAccept/Paymob-AI-Integration-Skill` as a custom marketplace source, t
 
 ### Cursor (Cursor Directory)
 
-Listed at [cursor.directory/plugins/paymob-integration](https://cursor.directory/plugins/paymob-integration). Use **Add to Cursor** on the listing for the skill, the `paymob` MCP server, and the three commands.
+Listed at [cursor.directory/plugins/paymob-integration](https://cursor.directory/plugins/paymob-integration). Use **Add to Cursor** on the listing for the skill and commands. Live account access is a separate optional component.
 
 Install the **Skill** component alongside the commands. Each command resolves the skill's reference files at run time and stops rather than answering from memory if it can't reach them, so a command installed on its own is safe but inert.
 
@@ -322,24 +329,34 @@ Paymob-AI-Integration-Skill/
 ├── universal-prompt.md                # Portable prompt (Cursor, Windsurf, Copilot, ChatGPT, Gemini, …)
 ├── .mcp.json                          # Bundled Paymob MCP server (auto-registers when the plugin is enabled)
 ├── .codex-plugin/
-│   └── plugin.json                    # Codex/ChatGPT plugin manifest (v3.3.0)
+│   └── plugin.json                    # Codex/ChatGPT plugin manifest (v3.4.0)
 ├── .claude-plugin/
-│   ├── plugin.json                    # Claude Code plugin manifest (v3.3.0)
+│   ├── plugin.json                    # Claude Code plugin manifest (v3.4.0)
 │   └── marketplace.json               # Claude custom marketplace catalog
 ├── commands/                          # Claude Code slash commands (additive, Claude-only)
 │   ├── paymob-test-cards.md           # /paymob-test-cards — sandbox test cards/wallets
 │   ├── paymob-explain-error.md        # /paymob-explain-error — error code → cause + fix
-│   └── paymob-check-hmac.md           # /paymob-check-hmac — static HMAC verification audit
+│   ├── paymob-check-hmac.md           # /paymob-check-hmac — static HMAC verification audit
+│   ├── paymob-setup-check.md           # /paymob-setup-check — secret-safe local preflight
+│   └── paymob-sandbox-check.md         # /paymob-sandbox-check — staged sandbox diagnosis
 ├── skills/
 │   └── paymob-integration/
 │       ├── SKILL.md                   # Workflow backbone + multi-agent safety
 │       ├── agents/
 │       │   └── openai.yaml            # Codex UI, invocation, and MCP metadata
+│       ├── scripts/
+│       │   └── paymob_setup_check.py   # Secret-safe local configuration checker
 │       └── references/
+│           ├── credentials-and-integration-ids.md # Canonical dashboard/setup map
+│           ├── integration-safety.md   # Checkout, callback, lifecycle, logging contract
+│           ├── sandbox-quickstart.md   # Eight-stage sandbox test ladder
+│           ├── webhook-troubleshooting.md # Redacted callback diagnostics
+│           ├── payment-methods-and-features.md # Feature-to-reference router
 │           ├── shopify-apps.md        # Paymob Shopify apps (on-site / off-site / BNPL) + install path
 │           ├── intention-api.md       # Create Intention spec, Unified Checkout, common errors
 │           ├── mobile-sdks.md         # Native SDK flow (iOS / Android / Flutter / React Native)
 │           ├── hmac-verification.md   # Transaction HMAC: field order, SHA-512, worked example
+│           ├── transaction-hmac-fixture.json # Synthetic deterministic HMAC vector
 │           ├── transaction-inquiry.md # Pull-based status checks / reconciliation
 │           ├── test-credentials.md    # Sandbox cards, wallets, OTPs
 │           ├── advanced-features.md   # Subscriptions, saved cards (CIT/MIT), Auth/Cap, refund/void, split, fees
@@ -388,7 +405,7 @@ Paymob-AI-Integration-Skill/
 ## Security
 
 - Only the **Public Key** (`pk_*`) is safe in frontend code. The **Secret Key**, **API Key**, and **HMAC Secret** are server-side only — never commit them or ship them in a mobile binary.
-- **The HMAC-verified webhook callback is the source of truth** for payment status — never the browser redirect params or a mobile SDK result.
+- **The HMAC-verified, stored-attempt-bound webhook callback is the source of truth** for payment status — never the browser redirect params or a mobile SDK result.
 - Always verify HMAC with **SHA-512** and a timing-safe comparison, and process callbacks atomically: unique `obj.id`, compare-and-set order state, and a uniquely keyed transactional outbox; use `order.id` / `special_reference` only for correlation.
 
 ## Staying current

@@ -13,6 +13,8 @@ Test and live modes share the same base URL per region — the mode is controlle
 
 The Intention creation endpoint is `POST /v1/intention/` on the relevant base URL (confirm exact path in the merchant's Postman collection/API explorer for their region, since path casing can vary slightly by region).
 
+Derive the base URL from an explicit region enum and allow only the four exact HTTPS origins above. Reject custom hosts, ports, userinfo, and paths before attaching the Secret Key.
+
 ## Create Intention
 
 ### Auth
@@ -29,12 +31,14 @@ Header: `Authorization: Token <SECRET_KEY>` (note the literal word "Token", not 
 | `items` | array | no | Each item needs at minimum `name` and `amount`; omitting either causes a 400 |
 | `billing_data` | object | yes (in practice) | Must include `phone_number` — missing it causes a 400. Also typically: `first_name`, `last_name`, `email`, `street`, `building`, `floor`, `apartment`, `city`, `country` (3-letter ISO), `state` |
 | `extras` | object | no | Arbitrary custom merchant data; echoed back in callbacks under the payment `claims` object |
-| `special_reference` | string | no | Your own internal order ID — returned in the transaction callback as `merchant_order_id`. Use this to correlate orders |
+| `special_reference` | string | no | Opaque server-created payment-attempt reference — returned in the transaction callback as `merchant_order_id`. Use it for correlation, never as authorization or the provider-event idempotency key |
 | `expiration` | number | no | Intention expiry in seconds |
 | `notification_url` | string | no | Your webhook endpoint — receives the POST callback with full transaction details. **Card Integration IDs only** |
 | `redirection_url` | string | no | Where the customer is redirected after payment, with transaction details as query params. **Card and Wallet methods only**. Not authenticated — don't trust it for order state |
 
 ### Example request
+
+Build every payment fact below from trusted server-side order/configuration data. The browser should supply only an authenticated opaque checkout-session/order identifier; never accept its amount, currency, items, Integration IDs, account/mode, or fulfillment target as authoritative.
 
 ```json
 {
@@ -57,8 +61,8 @@ Header: `Authorization: Token <SECRET_KEY>` (note the literal word "Token", not 
     "country": "EGY",
     "state": "Cairo"
   },
-  "extras": { "merchant_order_id": "order_123" },
-  "special_reference": "order_123",
+  "extras": { "merchant_order_id": "attempt_opaque_123" },
+  "special_reference": "attempt_opaque_123",
   "notification_url": "https://yourapp.com/api/paymob/callback",
   "redirection_url": "https://yourapp.com/checkout/result"
 }
@@ -98,7 +102,7 @@ https://accept.paymob.com/unifiedcheckout/?publicKey=pk_test_abc123&clientSecret
 ```json
 { "detail": "Integration ID/Name does not exist in our system. You can find the list of Integration ID's/Names from Merchant Dashboard under Developers → Payment Integrations Tab" }
 ```
-(Note: this is Paymob's literal API error text; in the current dashboard, Integration IDs are actually found under **Settings → Payment Integrations**.)
+(Note: this is Paymob's literal API error text; follow the canonical dashboard path in `credentials-and-integration-ids.md`.)
 Checklist to fix: (1) Integration ID's Test/Live status must match the Secret Key's status, (2) ID belongs to this merchant account and is an online integration, (3) ID is fully configured — if not, merchant should contact support@paymob.com.
 
 **400 — missing item fields**
@@ -115,4 +119,4 @@ Fix: always populate `billing_data.phone_number`.
 
 ## After payment: callbacks are the source of truth
 
-Paymob sends a `notification_url` POST with full transaction details once the payment is processed (success or fail), and separately redirects the customer via `redirection_url`. **Always treat the callback as authoritative and verify its HMAC before updating order state** (see `hmac-verification.md`) — the redirect is for UX only and its query params are not signed/verifiable the same way.
+Paymob sends a `notification_url` POST with full transaction details once the payment is processed (success or fail), and separately redirects the customer via `redirection_url`. Verify the callback HMAC first, then bind amount, currency, Integration ID, Paymob owner/account, mode, merchant reference, and provider IDs to the stored attempt before updating business state. Apply the lifecycle classifier in `integration-safety.md`; the redirect is for UX only.

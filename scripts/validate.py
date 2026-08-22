@@ -21,12 +21,22 @@ CLAUDE_MARKETPLACE = ROOT / ".claude-plugin" / "marketplace.json"
 MCP_MANIFEST = ROOT / ".mcp.json"
 OPENAI_METADATA = SKILL_DIR / "agents" / "openai.yaml"
 README = ROOT / "README.md"
+VALIDATE_WORKFLOW = ROOT / ".github" / "workflows" / "validate.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
+DEV_REQUIREMENTS = ROOT / "requirements-dev.txt"
 AGENTS = ROOT / "AGENTS.md"
 UNIVERSAL_PROMPT = ROOT / "universal-prompt.md"
 MCP_REFERENCE = SKILL_DIR / "references" / "mcp-server.md"
 HMAC_REFERENCE = SKILL_DIR / "references" / "hmac-verification.md"
 ADVANCED_REFERENCE = SKILL_DIR / "references" / "advanced-features.md"
+INTEGRATION_SAFETY_REFERENCE = SKILL_DIR / "references" / "integration-safety.md"
+CREDENTIALS_REFERENCE = SKILL_DIR / "references" / "credentials-and-integration-ids.md"
+SANDBOX_REFERENCE = SKILL_DIR / "references" / "sandbox-quickstart.md"
+WEBHOOK_TROUBLESHOOTING_REFERENCE = SKILL_DIR / "references" / "webhook-troubleshooting.md"
+FEATURE_ROUTER_REFERENCE = SKILL_DIR / "references" / "payment-methods-and-features.md"
+FRONTEND_REFERENCE = SKILL_DIR / "references" / "code-frontend.md"
+INQUIRY_REFERENCE = SKILL_DIR / "references" / "transaction-inquiry.md"
+HMAC_FIXTURE = SKILL_DIR / "references" / "transaction-hmac-fixture.json"
 COMMANDS_DIR = ROOT / "commands"
 NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 LOCAL_LINK_PATTERN = re.compile(r"\]\((?!https?://|mailto:|#)([^)#]+)(?:#[^)]+)?\)")
@@ -318,6 +328,7 @@ def validate_install_docs(version: str, errors: list[str]) -> None:
 
 def validate_release_workflow(errors: list[str]) -> None:
     workflow = read_text(RELEASE_WORKFLOW, errors)
+    validation_workflow = read_text(VALIDATE_WORKFLOW, errors)
     if not workflow:
         return
     required = (
@@ -325,15 +336,32 @@ def validate_release_workflow(errors: list[str]) -> None:
         '"v*"',
         'contents: write',
         'python scripts/validate.py',
+        'python -m unittest discover -s tests -v',
         'python scripts/package_skill.py',
         'Path(".codex-plugin/plugin.json")',
         'dist/paymob-integration.zip',
+        'dist/paymob-integration.zip.sha256',
         'gh release create',
         '--verify-tag',
     )
     for term in required:
         if term not in workflow:
             errors.append(f"Release workflow is missing required behavior: {term}")
+    if "--clobber" in workflow:
+        errors.append("Release workflow must not overwrite immutable release assets")
+
+    for label, text in (("release.yml", workflow), ("validate.yml", validation_workflow)):
+        if "python -m unittest discover -s tests -v" not in text:
+            errors.append(f"{label} must run the regression tests")
+        if "paymob-integration.zip.sha256" not in text:
+            errors.append(f"{label} must generate and retain the ZIP checksum")
+        for action, reference in re.findall(r"uses:\s*([^@\s]+)@([^\s#]+)", text):
+            if not re.fullmatch(r"[0-9a-f]{40}", reference):
+                errors.append(f"{label} action {action} must be pinned to a full commit SHA")
+
+    requirements = read_text(DEV_REQUIREMENTS, errors)
+    if not re.fullmatch(r"PyYAML==\d+\.\d+\.\d+\s*", requirements):
+        errors.append("requirements-dev.txt must pin PyYAML to one exact patch version")
 
 
 def require_terms(label: str, text: str, terms: tuple[str, ...], errors: list[str]) -> None:
@@ -350,6 +378,13 @@ def validate_safety_contract(errors: list[str]) -> None:
     mcp_reference = read_text(MCP_REFERENCE, errors)
     advanced = read_text(ADVANCED_REFERENCE, errors)
     hmac_reference = read_text(HMAC_REFERENCE, errors)
+    integration_safety = read_text(INTEGRATION_SAFETY_REFERENCE, errors)
+    credentials = read_text(CREDENTIALS_REFERENCE, errors)
+    sandbox = read_text(SANDBOX_REFERENCE, errors)
+    webhook_troubleshooting = read_text(WEBHOOK_TROUBLESHOOTING_REFERENCE, errors)
+    feature_router = read_text(FEATURE_ROUTER_REFERENCE, errors)
+    frontend = read_text(FRONTEND_REFERENCE, errors)
+    inquiry = read_text(INQUIRY_REFERENCE, errors)
 
     shared_terms = (
         "explicit confirmation",
@@ -395,16 +430,101 @@ def validate_safety_contract(errors: list[str]) -> None:
             "compare-and-set",
             "transactional outbox",
             "duplicate event",
+            "exactly one `hmac` value",
             "only the committed outbox worker",
         ),
         errors,
     )
+    require_terms(
+        "advanced-features.md",
+        advanced,
+        (
+            "PAYMOB_BASE_URL does not match PAYMOB_REGION",
+            "Paymob key mode mismatch",
+            "application-level RBAC",
+            "mandate/consent",
+            "stable operation fingerprint",
+            "[0-9a-fA-F]{128}",
+            "Buffer.from(receivedHmac, 'hex')",
+            "bytes.fromhex(received)",
+        ),
+        errors,
+    )
+    require_terms(
+        "universal-prompt.md",
+        universal,
+        (
+            "all three HMAC types",
+            "exactly 128 ASCII hex characters",
+            "decoded 64-byte digests",
+            "malformed input",
+        ),
+        errors,
+    )
+    require_terms(
+        "integration-safety.md",
+        integration_safety,
+        (
+            "authenticated, opaque",
+            "trusted storage",
+            "amount",
+            "currency",
+            "integration id",
+            "owner/account",
+            "unique constraint",
+            "compare-and-set",
+            "fulfillment outbox",
+            "exempt only the paymob webhook",
+            "never log raw callbacks",
+        ),
+        errors,
+    )
+    require_terms(
+        "credentials-and-integration-ids.md",
+        credentials,
+        (
+            "settings",
+            "api keys",
+            "payment integrations",
+            "minimum local configuration",
+            "PAYMOB_BASE_URL",
+            "APP_URL",
+            "never print environment-variable values",
+            "test/live mismatch",
+        ),
+        errors,
+    )
+    require_terms(
+        "sandbox-quickstart.md",
+        sandbox,
+        ("configuration", "hmac", "business binding", "state and fulfillment", "reconciliation"),
+        errors,
+    )
+    require_terms(
+        "webhook-troubleshooting.md",
+        webhook_troubleshooting,
+        ("earliest failing stage", "raw request body", "binding", "persistence"),
+        errors,
+    )
+    require_terms(
+        "payment-methods-and-features.md",
+        feature_router,
+        ("route by need", "saved cards", "refund", "reconciliation"),
+        errors,
+    )
     backend_handlers = {
-        "nodejs": ("await paymentEventStore.recordSuccessfulEvent", "res.status(200)"),
-        "python": ("payment_store.record_successful_event", "return JsonResponse({\"received\": True})"),
-        "php": ("recordSuccessfulEvent(", "return response()->json(['received' => true])"),
-        "dotnet": ("await paymentStore.RecordSuccessfulEventAsync", "return Results.Ok"),
-        "ruby": ("PaymobPaymentEventStore.record_successful_event!", "render json: { received: true }"),
+        "nodejs": ("await paymentEventStore.recordVerifiedEvent", "res.status(200)"),
+        "python": ("payment_store.record_verified_event", "return JsonResponse({\"received\": True})"),
+        "php": ("recordVerifiedEvent(", "return response()->json(['received' => true])"),
+        "dotnet": ("await paymentStore.RecordVerifiedEventAsync", "return Results.Ok"),
+        "ruby": ("PaymobPaymentEventStore.record_verified_event!", "render json: { received: true }"),
+    }
+    null_guards = {
+        "nodejs": "value == null",
+        "python": "value is None",
+        "php": "in_array(null",
+        "dotnet": "JsonValueKind.Null",
+        "ruby": "any?(&:nil?)",
     }
     for stack, (invocation, acknowledgement) in backend_handlers.items():
         code_reference = SKILL_DIR / "references" / f"code-{stack}.md"
@@ -413,7 +533,17 @@ def validate_safety_contract(errors: list[str]) -> None:
         require_terms(
             label,
             code_text,
-            ("UNIQUE provider event", "compare-and-set", "outbox worker"),
+            (
+                "PAYMOB_BASE_URL does not match PAYMOB_REGION",
+                "Paymob key mode mismatch",
+                "binding mismatch",
+                "UNIQUE provider event",
+                "ordered lifecycle classifier",
+                "One HMAC value required",
+                "compare-and-set",
+                "fulfillment outbox",
+                null_guards[stack],
+            ),
             errors,
         )
         invocation_at = code_text.find(invocation)
@@ -429,6 +559,57 @@ def validate_safety_contract(errors: list[str]) -> None:
     ):
         errors.append("Transaction Inquiry must not use the Secret Key authorization header")
 
+    prohibited = (
+        (
+            "code-frontend.md",
+            frontend,
+            re.compile(r"JSON\.stringify\(\s*\{\s*(?:amount|amountCents|currency|items)\b"),
+            "Frontend checkout examples must not send authoritative payment facts",
+        ),
+        (
+            "code-frontend.md",
+            frontend,
+            re.compile(r"\bcart\.total\b"),
+            "Frontend checkout examples must not derive the amount from the cart",
+        ),
+        (
+            "code-python.md",
+            read_text(SKILL_DIR / "references" / "code-python.md", errors),
+            re.compile(r"@csrf_exempt\s+def create_checkout"),
+            "Python checkout must remain CSRF protected",
+        ),
+        (
+            "code-ruby.md",
+            read_text(SKILL_DIR / "references" / "code-ruby.md", errors),
+            re.compile(r"skip_forgery_protection\s+only:\s*\[:webhook,\s*:checkout\]"),
+            "Ruby checkout must remain CSRF protected",
+        ),
+        (
+            "advanced-features.md",
+            advanced,
+            re.compile(r"idempotently\s+on\s+(?:obj\.)?order\.id", re.IGNORECASE),
+            "Provider-event idempotency must not use the order ID",
+        ),
+        (
+            "transaction-inquiry.md",
+            inquiry,
+            re.compile(r"idempotently\s+on\s+(?:obj\.)?order\.id", re.IGNORECASE),
+            "Inquiry idempotency must not use the order ID",
+        ),
+    )
+    for label, text, pattern, message in prohibited:
+        if pattern.search(text):
+            errors.append(f"{label}: {message}")
+
+    fixture = load_json(HMAC_FIXTURE, errors)
+    signature = fixture.get("hmac_sha512")
+    if fixture and (
+        fixture.get("secret") != "test_hmac_secret"
+        or not isinstance(signature, str)
+        or not re.fullmatch(r"[0-9a-f]{128}", signature)
+    ):
+        errors.append("transaction-hmac-fixture.json must remain synthetic and contain a 128-hex digest")
+
 
 def validate_commands(errors: list[str]) -> None:
     if not COMMANDS_DIR.is_dir():
@@ -438,6 +619,19 @@ def validate_commands(errors: list[str]) -> None:
     if not command_files:
         errors.append("commands/ directory has no command files")
         return
+    expected_commands = {
+        "paymob-check-hmac.md",
+        "paymob-explain-error.md",
+        "paymob-sandbox-check.md",
+        "paymob-setup-check.md",
+        "paymob-test-cards.md",
+    }
+    actual_commands = {path.name for path in command_files}
+    if actual_commands != expected_commands:
+        errors.append(
+            "commands/ must contain the documented five commands; found: "
+            + ", ".join(sorted(actual_commands))
+        )
 
     for path in command_files:
         label = str(path.relative_to(ROOT))

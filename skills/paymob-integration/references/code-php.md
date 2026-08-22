@@ -5,6 +5,8 @@ Clean, correct reference (Intention API + Unified Checkout + HMAC-verified webho
 ## Environment (`.env`)
 
 ```env
+PAYMOB_REGION=egypt
+PAYMOB_MODE=test
 PAYMOB_BASE_URL=https://accept.paymob.com
 PAYMOB_SECRET_KEY=sk_test_xxxxxxxx
 PAYMOB_PUBLIC_KEY=pk_test_xxxxxxxx
@@ -29,10 +31,26 @@ class Paymob
 
     public function __construct()
     {
-        $this->base       = rtrim(getenv('PAYMOB_BASE_URL') ?: 'https://accept.paymob.com', '/');
-        $this->secret     = getenv('PAYMOB_SECRET_KEY');
-        $this->public     = getenv('PAYMOB_PUBLIC_KEY');
-        $this->hmacSecret = getenv('PAYMOB_HMAC_SECRET');
+        $region = strtolower($this->requiredEnv('PAYMOB_REGION'));
+        $mode = strtolower($this->requiredEnv('PAYMOB_MODE'));
+        $bases = ['egypt' => 'https://accept.paymob.com', 'uae' => 'https://uae.paymob.com',
+                  'ksa' => 'https://ksa.paymob.com', 'oman' => 'https://oman.paymob.com'];
+        if (!isset($bases[$region]) || !in_array($mode, ['test', 'live'], true)) {
+            throw new RuntimeException('Invalid Paymob region or mode');
+        }
+        $this->base = $bases[$region];
+        if (rtrim($this->requiredEnv('PAYMOB_BASE_URL'), '/') !== $this->base) {
+            throw new RuntimeException('PAYMOB_BASE_URL does not match PAYMOB_REGION');
+        }
+        $this->secret     = $this->requiredEnv('PAYMOB_SECRET_KEY');
+        $this->public     = $this->requiredEnv('PAYMOB_PUBLIC_KEY');
+        $this->hmacSecret = $this->requiredEnv('PAYMOB_HMAC_SECRET');
+        foreach ([$this->secret, $this->public] as $credential) {
+            if (preg_match('/(?:^|_)(test|live)_/i', $credential, $match)
+                && strtolower($match[1]) !== $mode) {
+                throw new RuntimeException('Paymob key mode mismatch');
+            }
+        }
     }
 
     public function createIntention(array $args): array
@@ -50,7 +68,7 @@ class Paymob
                 'phone_number' => $args['customer']['phone'],   // REQUIRED
                 'apartment' => 'NA', 'floor' => 'NA', 'street' => 'NA', 'building' => 'NA',
                 'shipping_method' => 'NA', 'postal_code' => 'NA', 'city' => 'NA',
-                'state' => 'NA', 'country' => 'EGY',
+                'state' => 'NA', 'country' => $args['billing_country'],
             ],
             'customer' => [
                 'first_name' => $args['customer']['first_name'],
@@ -72,34 +90,34 @@ class Paymob
 
     public function verifyTransactionPostHmac(array $obj, string $receivedHmac): bool
     {
-        $fields = [
-            $obj['amount_cents'], $obj['created_at'], $obj['currency'], $obj['error_occured'],
-            $obj['has_parent_transaction'], $obj['id'], $obj['integration_id'], $obj['is_3d_secure'],
-            $obj['is_auth'], $obj['is_capture'], $obj['is_refunded'], $obj['is_standalone_payment'],
-            $obj['is_voided'], $obj['order']['id'], $obj['owner'], $obj['pending'],
-            $obj['source_data']['pan'], $obj['source_data']['sub_type'],
-            $obj['source_data']['type'], $obj['success'],
-        ];
-        $concat   = implode('', array_map([$this, 'boolStr'], $fields));
-        $computed = hash_hmac('sha512', $concat, $this->hmacSecret);
-        return hash_equals($computed, $receivedHmac);
-    }
-
-    public function refund(int $txnId, int $amountCents): array
-    {
-        return $this->post('/api/acceptance/void_refund/refund',
-            ['transaction_id' => $txnId, 'amount_cents' => $amountCents]);
-    }
-
-    public function voidTxn(int $txnId): array
-    {
-        return $this->post('/api/acceptance/void_refund/void', ['transaction_id' => $txnId]);
-    }
-
-    public function capture(int $txnId, int $amountCents): array
-    {
-        return $this->post('/api/acceptance/capture',
-            ['transaction_id' => $txnId, 'amount_cents' => $amountCents]);
+        if (!preg_match('/\A[0-9a-fA-F]{128}\z/', $receivedHmac)) return false;
+        $top = ['amount_cents', 'created_at', 'currency', 'error_occured',
+                'has_parent_transaction', 'id', 'integration_id', 'is_3d_secure',
+                'is_auth', 'is_capture', 'is_refunded', 'is_standalone_payment',
+                'is_voided', 'owner', 'pending', 'success'];
+        foreach ($top as $key) if (!array_key_exists($key, $obj)) return false;
+        if (!is_array($obj['order'] ?? null) || !array_key_exists('id', $obj['order'])) return false;
+        if (!is_array($obj['source_data'] ?? null)) return false;
+        foreach (['pan', 'sub_type', 'type'] as $key) {
+            if (!array_key_exists($key, $obj['source_data'])) return false;
+        }
+        try {
+            $fields = [
+                $obj['amount_cents'], $obj['created_at'], $obj['currency'], $obj['error_occured'],
+                $obj['has_parent_transaction'], $obj['id'], $obj['integration_id'], $obj['is_3d_secure'],
+                $obj['is_auth'], $obj['is_capture'], $obj['is_refunded'], $obj['is_standalone_payment'],
+                $obj['is_voided'], $obj['order']['id'], $obj['owner'], $obj['pending'],
+                $obj['source_data']['pan'], $obj['source_data']['sub_type'],
+                $obj['source_data']['type'], $obj['success'],
+            ];
+            if (in_array(null, $fields, true)) return false;
+            $concat   = implode('', array_map([$this, 'boolStr'], $fields));
+            $computed = hash_hmac('sha512', $concat, $this->hmacSecret, true);
+            $received = hex2bin($receivedHmac);
+            return $received !== false && hash_equals($computed, $received);
+        } catch (Throwable) {
+            return false;
+        }
     }
 
     /** Paymob concatenates booleans as lowercase true/false; PHP's (string)true is "1". */
@@ -107,6 +125,15 @@ class Paymob
     {
         if (is_bool($v)) return $v ? 'true' : 'false';
         return (string) $v;
+    }
+
+    private function requiredEnv(string $name): string
+    {
+        $value = getenv($name);
+        if (!is_string($value) || trim($value) === '' || preg_match('/xxxxx|changeme|replace_me|your_|example/i', $value)) {
+            throw new RuntimeException("Missing or placeholder $name");
+        }
+        return $value;
     }
 
     private function post(string $path, array $body): array
@@ -135,38 +162,81 @@ class Paymob
 
 > **Boolean fix:** PHP casts `true` to `"1"`, but Paymob's HMAC expects `"true"`/`"false"`. Use `boolStr()` (above) instead of plain `(string)` when concatenating, or HMAC verification silently fails.
 
-## Laravel webhook route
+Keep refund/void/capture out of the basic checkout client. If required, implement the controlled application service described in `advanced-features.md` and `integration-safety.md`.
+
+## Laravel checkout and webhook routes
 
 ```php
 // routes/web.php  (or api.php)
 use Illuminate\Http\Request;
+use App\Contracts\CheckoutStore;
 use App\Contracts\PaymobPaymentEventStore;
+use App\Support\PaymobTransactionState;
+
+Route::post('/api/checkout', function (Request $request) {
+    $request->validate(['checkoutSessionId' => ['required', 'string', 'max:200']]);
+    $attempt = app(CheckoutStore::class)->prepareAttempt(
+        checkoutSessionId: $request->string('checkoutSessionId')->toString(),
+        customerId: (string) $request->user()->getAuthIdentifier(),
+    );
+    $paymob = new Paymob();
+    $intention = $paymob->createIntention([
+        'amount_cents' => $attempt->amountCents,
+        'currency' => $attempt->currency,
+        'payment_methods' => $attempt->paymentMethods,
+        'special_reference' => $attempt->reference,
+        'customer' => $attempt->customer,
+        'billing_country' => $attempt->billingCountry,
+        'items' => $attempt->items,
+    ]);
+    app(CheckoutStore::class)->attachPaymobIntention($attempt->id, $intention['id']);
+    return response()->json([
+        'checkout_url' => $paymob->checkoutUrl($intention['client_secret']),
+        'checkoutAttemptToken' => $attempt->statusToken,
+    ]);
+})->middleware('auth');
 
 Route::post('/api/paymob/webhook', function (Request $request) {
+    if (! $request->isJson()) {
+        return response()->json(['error' => 'JSON required'], 415);
+    }
+    if ((int) $request->server('CONTENT_LENGTH', 0) > 65536) {
+        return response()->json(['error' => 'Payload too large'], 413);
+    }
     $paymob   = new Paymob();
     $obj      = $request->input('obj', []);
-    $received = $request->query('hmac', '');
+    if (!is_array($obj)) {
+        return response()->json(['error' => 'Invalid obj'], 400);
+    }
+    $received = $request->query('hmac');
+    if (!is_string($received)) {
+        return response()->json(['error' => 'One HMAC value required'], 400);
+    }
 
     if (empty($obj) || ! $paymob->verifyTransactionPostHmac($obj, $received)) {
         return response()->json(['error' => 'Invalid HMAC'], 401);
     }
-    if (($obj['success'] ?? false) && ! ($obj['pending'] ?? false)) {
-        app(PaymobPaymentEventStore::class)->recordSuccessfulEvent(
-            providerEventId: (string) $obj['id'],
-            paymobOrderId: (string) $obj['order']['id'],
-            merchantOrderId: (string) ($obj['order']['merchant_order_id'] ?? ''),
-        );
-    }
+    app(PaymobPaymentEventStore::class)->recordVerifiedEvent(
+        providerEventId: (string) $obj['id'],
+        paymobOrderId: (string) $obj['order']['id'],
+        merchantOrderId: (string) ($obj['order']['merchant_order_id'] ?? ''),
+        amountCents: (int) $obj['amount_cents'],
+        currency: (string) $obj['currency'],
+        integrationId: (int) $obj['integration_id'],
+        owner: (string) $obj['owner'],
+        classification: PaymobTransactionState::classify($obj),
+    );
     return response()->json(['received' => true]);  // 200 stops Paymob retries
 });
 ```
 
-`PaymobPaymentEventStore::recordSuccessfulEvent` is a required persistence adapter. In one database transaction it must insert a UNIQUE provider event keyed by `$obj['id']`, compare-and-set the order state, and insert a UNIQUE fulfillment outbox row. Let failures propagate to non-2xx; only the outbox worker fulfills.
+The adapters and `PaymobTransactionState::classify` are required application boundaries. Follow `integration-safety.md`: bind the verified event to the stored attempt, commit a binding mismatch as a quarantined no-op, insert a UNIQUE provider event keyed by `$obj['id']`, apply the ordered lifecycle classifier and compare-and-set, and insert a UNIQUE fulfillment outbox row only for a completed sale/capture. Throw only when the atomic persistence transaction fails. Return status through an authenticated, ownership-checked endpoint using `statusToken`.
 
-In Laravel, exclude this route from CSRF protection (add the path to `VerifyCsrfToken::$except`).
+Put checkout in the session-authenticated web route group. Exclude only the Paymob webhook route from CSRF protection, and enforce the same 64 KiB limit at the web server/proxy for chunked requests. Keep checkout and status routes authenticated and CSRF-protected.
 
 ## Gotchas
 
-- Header `Authorization: Token <secret>` (not Bearer). Amount in **cents**. `phone_number` required.
+- Header `Authorization: Token <secret>` (not Bearer). Derive amount/items/currency/Integration IDs server-side. `phone_number` is required.
 - Use `boolStr()` so booleans concatenate as `true`/`false` for HMAC.
 - Always `hash_equals()` (timing-safe). Verify HMAC before trusting `success`; never trust redirect params. `client_secret` is single-use.
+- Validate the exact Paymob origin before attaching the Secret Key, and emit redacted structured logs only.

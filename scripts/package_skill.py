@@ -13,11 +13,19 @@ SKILL_DIR = ROOT / "skills" / "paymob-integration"
 DEFAULT_OUTPUT = ROOT / "dist" / "paymob-integration.zip"
 ARCHIVE_ROOT = SKILL_DIR.name
 FIXED_TIMESTAMP = (2020, 1, 1, 0, 0, 0)
+EXCLUDED_PARTS = {"__pycache__"}
+EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 
 
 def source_files() -> list[Path]:
     """Return the canonical skill files in stable archive order."""
-    return sorted(path for path in SKILL_DIR.rglob("*") if path.is_file())
+    return sorted(
+        path
+        for path in SKILL_DIR.rglob("*")
+        if path.is_file()
+        and not EXCLUDED_PARTS.intersection(path.relative_to(SKILL_DIR).parts)
+        and path.suffix.lower() not in EXCLUDED_SUFFIXES
+    )
 
 
 def build_archive(output: Path) -> None:

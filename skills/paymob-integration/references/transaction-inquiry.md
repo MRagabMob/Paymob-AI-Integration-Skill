@@ -10,7 +10,7 @@ The Intention API + HMAC-verified callback (see `intention-api.md` and `hmac-ver
 
 1. **Callback didn't arrive within an expected window.** If your `notification_url` hasn't received a callback within a few minutes of the customer reaching a success/fail screen on Paymob's checkout (network blip, firewall blocking the webhook, server downtime during deploy), proactively inquire about the transaction/order instead of leaving it stuck in "pending" forever.
 2. **Reconciliation jobs.** A scheduled job (e.g. hourly/daily) that cross-checks your "pending" or "awaiting payment" orders against Paymob's records, to catch any callback that was missed or a duplicate that slipped past idempotency checks.
-3. **Customer support / dispute lookups.** A support agent or admin panel needs to pull current status/details for one order without digging through raw webhook logs.
+3. **Customer support / dispute lookups.** An authorized support agent or admin panel needs to pull the current status/details for one tenant-owned order using redacted operational records.
 4. **Before manually adjusting an order's status.** Always re-confirm the live status via Inquiry before, e.g., manually marking an order paid — don't trust a stale local DB state.
 
 ### When NOT to use it
@@ -67,4 +67,6 @@ Paymob's Transaction Inquiry API also supports searching by **your own** order i
 - Base URL is the same regional base used for the Intention API (`accept.paymob.com`, `oman.paymob.com`, `ksa.paymob.com`, or `uae.paymob.com`).
 - Match Test/Live: an Inquiry auth token generated with a Test API Key will only see Test-mode transactions, and vice versa.
 - Rate-limit yourself: don't reconciliation-poll in a tight loop — a periodic job (e.g. every few minutes for "still pending" orders, falling off after some max age) is enough.
-- Treat the Inquiry response the same way you treat a verified callback: read `success`/`pending`/`is_voided`/`is_refunded` to determine real state, and update your order using the same idempotent logic keyed on `order.id` / `special_reference`.
+- Bind the Inquiry response to the stored payment attempt using amount, currency, Integration ID, Paymob owner/account, mode, merchant reference, and known provider IDs. Apply the same lifecycle compare-and-set rules as a verified callback.
+- Use the provider transaction/event ID to identify a payment observation. Use `order.id` / `special_reference` only for correlation; one order can have multiple attempts. Keep fulfillment unique on the local business order so reconciliation cannot fulfill twice.
+- Never log the returned token, the full inquiry URL, raw transaction/customer data, or saved-card tokens. Record only the allowlisted metadata in `integration-safety.md`.

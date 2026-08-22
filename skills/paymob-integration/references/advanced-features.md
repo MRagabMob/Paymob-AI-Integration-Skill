@@ -8,7 +8,7 @@ All endpoints below use the regional base URL from `intention-api.md` and, unles
 
 These act on a completed transaction by its `transaction_id` (from the verified callback).
 
-Before any live refund, void, or capture, read the current transaction state and obtain explicit confirmation for this exact account, mode, operation, transaction, amount, and currency. Keep a stable operation fingerprint. Never auto-retry after a timeout or ambiguous response; inquire whether the first request succeeded, then verify and report the final remote state.
+Before any live refund, void, or capture, enforce application-level RBAC and tenant/account ownership, read the current transaction state, validate amount/currency limits, and record the actor and reason. Obtain explicit confirmation for this exact account, mode, operation, transaction, amount, and currency. Keep a stable operation fingerprint. Never auto-retry after a timeout or ambiguous response; inquire whether the first request succeeded, then verify and report the final remote state. Never expose the low-level helpers below directly as public routes.
 
 ```http
 POST {base_url}/api/acceptance/void_refund/refund
@@ -41,11 +41,29 @@ Content-Type: application/json
 ```javascript
 // Node.js — refund/void/capture share the same auth header
 const axios = require('axios');
+const baseByRegion = {
+  egypt: 'https://accept.paymob.com', uae: 'https://uae.paymob.com',
+  ksa: 'https://ksa.paymob.com', oman: 'https://oman.paymob.com',
+};
+const region = String(process.env.PAYMOB_REGION || '').toLowerCase();
+const mode = String(process.env.PAYMOB_MODE || '').toLowerCase();
+const baseURL = baseByRegion[region];
+if (!baseURL || !['test', 'live'].includes(mode)) throw new Error('Invalid Paymob region or mode');
+if (String(process.env.PAYMOB_BASE_URL || '').replace(/\/$/, '') !== baseURL) {
+  throw new Error('PAYMOB_BASE_URL does not match PAYMOB_REGION');
+}
+const secret = process.env.PAYMOB_SECRET_KEY;
+if (!secret || /xxxxx|changeme|replace_me|your_|example/i.test(secret)) {
+  throw new Error('Missing or placeholder PAYMOB_SECRET_KEY');
+}
+const keyMode = secret.match(/(?:^|_)(test|live)_/i)?.[1]?.toLowerCase();
+if (keyMode && keyMode !== mode) throw new Error('Paymob key mode mismatch');
 const api = axios.create({
-  baseURL: process.env.PAYMOB_BASE_URL,            // e.g. https://accept.paymob.com
-  headers: { Authorization: `Token ${process.env.PAYMOB_SECRET_KEY}` },
+  baseURL,
+  headers: { Authorization: `Token ${secret}` },
 });
 
+// Call these only from the authorized, audited application service described above.
 const refund  = (transactionId, amountCents) =>
   api.post('/api/acceptance/void_refund/refund', { transaction_id: transactionId, amount_cents: amountCents }).then(r => r.data);
 const voidTxn = (transactionId) =>
@@ -69,7 +87,7 @@ Reserve funds at checkout, capture (or void) them later — useful for order-ful
   "payment_methods": [123456],
   "is_auth": true,
   "billing_data": { "phone_number": "+201234567890", "first_name": "John", "last_name": "Doe", "email": "john@example.com" },
-  "special_reference": "order_123",
+  "special_reference": "attempt_opaque_auth_123",
   "notification_url": "https://yoursite.com/api/paymob/callback",
   "redirection_url": "https://yoursite.com/checkout/result"
 }
@@ -102,7 +120,7 @@ The first payment must be customer-initiated. Ask Paymob/the dashboard to enable
   "payment_methods": [123456],
   "billing_data": { "phone_number": "+201234567890", "first_name": "John", "last_name": "Doe", "email": "john@example.com" },
   "customer": { "first_name": "John", "last_name": "Doe", "email": "john@example.com" },
-  "special_reference": "order_123",
+  "special_reference": "attempt_opaque_cit_123",
   "notification_url": "https://yoursite.com/webhook",
   "redirection_url": "https://yoursite.com/complete",
   "extras": { "save_card": true }
@@ -120,19 +138,25 @@ card_subtype, created_at, email, id, masked_pan, merchant_id, order_id, token
 // Node.js — Card Token HMAC verification
 const crypto = require('crypto');
 function verifyCardTokenHmac(data, receivedHmac, secret) {
-  const fields = [
-    data.card_subtype, data.created_at, data.email, data.id,
-    data.masked_pan, data.merchant_id, data.order_id, data.token,
-  ];
-  const computed = crypto.createHmac('sha512', secret)
-    .update(fields.map(String).join('')).digest('hex');
-  return crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(receivedHmac));
+  if (!secret || !/^[a-f0-9]{128}$/i.test(receivedHmac)) return false;
+  try {
+    const fields = [
+      data.card_subtype, data.created_at, data.email, data.id,
+      data.masked_pan, data.merchant_id, data.order_id, data.token,
+    ];
+    if (fields.some(value => value == null)) return false;
+    const computed = crypto.createHmac('sha512', secret)
+      .update(fields.map(String).join('')).digest();
+    return crypto.timingSafeEqual(computed, Buffer.from(receivedHmac, 'hex'));
+  } catch { return false; }
 }
 ```
 
-Store **only** `token` and `masked_pan` (and the customer linkage). Never store raw card data. Verify the token-callback `email` matches your customer record.
+Store **only** `token` and `masked_pan` (and the customer linkage). Never store raw card data. Verify the token-callback `email` matches your customer record without logging either value.
 
 ### MIT (Merchant-Initiated Transaction) — charge the saved token later
+
+Treat every MIT charge as a consequential financial write: prove the customer's recorded mandate/consent, authorize the tenant/customer and billing schedule, derive amount/currency from trusted billing state, use a unique attempt/reference, and reconcile an ambiguous result before any retry.
 
 1. Create an Intention as normal (gives you a `client_secret`).
 2. Instead of redirecting the customer, charge the stored token directly:
@@ -160,6 +184,8 @@ Subscriptions are available to selected merchants — Paymob must enable the fea
 
 ### Auth note
 Subscription **plan management** uses a Bearer auth token (from the API-Key auth endpoint); attaching a subscription to a payment uses the normal `Authorization: Token <SECRET_KEY>` on the Intention.
+
+Plan creation or modification must be an authenticated administrative operation with tenant ownership, actor/reason audit, explicit account/mode, and a stable operation fingerprint. Never expose the raw plan-management request as an unauthenticated route.
 
 ```http
 POST {base_url}/api/auth/tokens
@@ -193,7 +219,7 @@ Attach the plan to a normal Intention (the first charge is CIT through checkout;
   "payment_methods": [123456],
   "subscription_plan_id": 789,
   "billing_data": { "phone_number": "+201234567890", "first_name": "John", "last_name": "Doe", "email": "john@example.com" },
-  "special_reference": "sub_order_123",
+  "special_reference": "attempt_opaque_sub_123",
   "notification_url": "https://yoursite.com/webhook",
   "redirection_url": "https://yoursite.com/complete"
 }
@@ -212,11 +238,21 @@ and the `hmac` is in the **request body**, not the query string.
 
 ```python
 # Python — Subscription HMAC verification
-import hashlib, hmac
+import hashlib, hmac, re
 def verify_subscription_hmac(body: dict, secret: str) -> bool:
-    s = f"{body['trigger_type']}for{body['subscription_data']['id']}"
-    computed = hmac.new(secret.encode(), s.encode(), hashlib.sha512).hexdigest()
-    return hmac.compare_digest(computed, body['hmac'])
+    received = body.get("hmac") if isinstance(body, dict) else None
+    if not secret or not isinstance(received, str) or not re.fullmatch(r"[0-9a-fA-F]{128}", received):
+        return False
+    try:
+        trigger = body["trigger_type"]
+        subscription_id = body["subscription_data"]["id"]
+        if trigger is None or subscription_id is None:
+            return False
+        payload = f"{trigger}for{subscription_id}".encode()
+        computed = hmac.new(secret.encode(), payload, hashlib.sha512).digest()
+        return hmac.compare_digest(computed, bytes.fromhex(received))
+    except (KeyError, TypeError, ValueError):
+        return False
 ```
 
 ### Manage
@@ -250,4 +286,4 @@ Add a fee on top of the order, configurable as **percentage**, **fixed**, or **c
 
 - Verify the correct HMAC type per callback: **transaction** (20 fields, query param), **card token** (8 fields, query param), **subscription** (string formula, request body). Wrong type/order silently breaks verification — see `hmac-verification.md`.
 - Always SHA-512, always timing-safe compare, never log secrets.
-- Treat every callback as the source of truth only **after** HMAC passes, and process idempotently on `order.id` / `special_reference`.
+- Treat every callback as authentic only **after** the correct HMAC passes, then bind it to the stored attempt and apply the lifecycle rules in `integration-safety.md`. For transaction callbacks, use `obj.id` as the unique provider-event key; use `order.id` / `special_reference` only for correlation.

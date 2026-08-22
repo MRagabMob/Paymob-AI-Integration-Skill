@@ -12,7 +12,7 @@ Dashboard → Settings → API Keys → HMAC Secret field. This is a separate se
 
 ## Calculation algorithm (Transaction Processed Callback)
 
-1. Paymob POSTs the transaction object to your `notification_url`, with `?hmac=<value>` on the URL as a query parameter.
+1. Paymob POSTs the transaction object to your `notification_url`, with `?hmac=<value>` on the URL as a query parameter. Require exactly one `hmac` value; reject a missing or duplicated parameter.
 2. The transaction data lives at `obj` in the POST body (i.e. `body.obj`).
 3. From `obj`, pull exactly these fields/keys, **in this exact order** (this is the documented concatenation order — note it is NOT simple alphabetical order of the literal key names below, it is the order Paymob specifies):
 
@@ -42,7 +42,7 @@ success
 4. Convert each value to its string representation (booleans become the literal strings `true`/`false`; numbers become their plain string form) and **concatenate them with no separator** in the order above.
 5. Compute `HMAC-SHA512(concatenated_string, hmac_secret)`.
 6. Convert the result to lowercase hex.
-7. Compare to the `hmac` query parameter from the callback URL. If they match exactly, the callback is authentic — proceed to update order state. If not, reject/ignore the callback (return 200 to avoid retries if your framework requires it, but do not act on the data).
+7. Require the received value to be exactly 128 ASCII hexadecimal characters, decode both digests to 64 bytes, and compare timing-safely. If they do not match, reject/ignore the callback and never act on its data.
 
 ### Worked example (from Paymob docs)
 
@@ -60,8 +60,11 @@ Resulting HMAC (SHA-512, hex, lowercase) — using the merchant's own HMAC secre
 - Build the concatenation purely from the **raw values as received** — don't reformat dates, don't round numbers, don't add/remove whitespace.
 - Watch out for `obj.order.id` vs a top-level `id` — both `id` and `order.id` appear in the list as separate fields; don't conflate them.
 - If a field is missing/null in a given callback type, check the live payload structure rather than assuming — different callback types (Transaction Processed vs Card Token) have different field lists and orders. This file covers the standard **Transaction Processed callback**. If the merchant also needs card-token callbacks (for "pay with saved card"), fetch the current field order from `https://developers.paymob.com/paymob-docs/developers/webhook-callbacks-and-hmac/hmac/hmac-for-card-tokens` before implementing, since the field set differs (it includes things like `card_subtype`, `email`, masked PAN, etc.) and getting the order wrong silently breaks verification.
-- Always log the raw callback body once during development/testing so you can confirm your field extraction matches reality for this specific merchant's payment methods — wallets and cards can return slightly different nested shapes.
+- Validate JSON type, required nested objects, and all 20 required fields before calculating. Missing, null, oversized, non-hex, wrong-length, or Unicode input must fail closed with a controlled response rather than raising a `500`.
+- Use Paymob's webhook testing tool and the bundled synthetic fixture in `transaction-hmac-fixture.json` to inspect/validate field extraction. In application logs, record only the allowlisted redacted metadata in `integration-safety.md`; never retain the raw callback.
 - Respond `200 OK` to Paymob promptly (process asynchronously if your business logic is slow) — webhook senders typically retry on non-2xx or timeout, which can cause duplicate processing unless `obj.id` is uniquely recorded and the order transition plus fulfillment outbox insert commit atomically.
+
+HMAC proves authenticity and integrity, not business correctness. After verification, require the callback to match the stored attempt's amount, currency, Integration ID, Paymob owner/account, mode, merchant reference, and provider identifiers before applying the lifecycle rules in `integration-safety.md`.
 
 ## Idempotency
 

@@ -46,6 +46,8 @@ Before anything else, find out **what the store is built on**. If it's not alrea
 | Other e-commerce platform with an official Paymob plugin (WooCommerce/WordPress, Magento 2, Odoo, OpenCart, PrestaShop, WHMCS, CS-Cart, ZenCart, Joomla, Laravel-Bagisto, osCommerce, Drupal, Staah) | **Prebuilt-plugin path** (below) — install Paymob's official plugin instead of hand-coding |
 | Custom-built (Node, Next.js, Django, PHP, mobile app, etc.) | Continue to **Step 0** below |
 
+For a custom build, also read `references/payment-methods-and-features.md` and establish the market, one-time vs recurring requirement, payment methods, saved-card/capture needs, and sandbox/live goal before generating code.
+
 ### Shopify path
 
 Read `references/shopify-apps.md` in full before responding. In short: Paymob ships as installable Shopify apps, not a custom API integration —
@@ -102,20 +104,22 @@ Do not proceed to writing integration code until Phase 1 is confirmed complete (
    - Document verification can take up to ~3 business days. They'll get an email when it's done.
 2. While waiting, the agent can still scaffold the codebase (env var placeholders, route stubs, DB schema for orders) — just don't hardcode real keys yet.
 3. **Wait/checkpoint:** ask the merchant to confirm they've received the "verification complete" email before continuing, OR confirm they already have test-mode credentials (test credentials are often available immediately, even before full live verification — ask the merchant to check Dashboard → Settings → API Keys).
-4. Once verified, instruct the merchant to collect these from the **Paymob Dashboard**:
-   - **API Key**, **Secret Key**, **Public Key**, **HMAC Secret** — Dashboard → Settings → API Keys (click "View" to reveal each)
-   - **Integration ID(s)** — Dashboard → Settings → Payment Integrations (one ID per payment method, e.g. Cards, Wallets, Kiosk; each has a Test and Live version)
-   - Note: every account starts in **Test mode**. Switch the toggle in the dashboard top-left to Live only after the integration is tested end-to-end (see Phase 3).
-5. Tell the merchant to store these as environment variables (never hardcode):
+4. Once verified, read `references/credentials-and-integration-ids.md` and guide the merchant through the canonical dashboard paths. Ask them to configure the values locally or in a secret manager; never ask them to paste keys into the AI conversation. Confirm one Integration ID per required method and keep Test and Live values separate.
+5. Tell the merchant to store these as environment variables (never hardcode or print their values):
    ```
+   PAYMOB_REGION=egypt
+   PAYMOB_MODE=test
+   PAYMOB_BASE_URL=https://accept.paymob.com
    PAYMOB_SECRET_KEY=
    PAYMOB_PUBLIC_KEY=
    PAYMOB_API_KEY=
    PAYMOB_HMAC_SECRET=
    PAYMOB_INTEGRATION_ID_CARD=
+   APP_URL=https://your-public-test-host.example
    # add one var per enabled payment method (wallet, kiosk, etc.)
    ```
    (`PAYMOB_API_KEY` is only needed for the Transaction Inquiry / reconciliation flow — see `references/transaction-inquiry.md`.)
+6. Run `scripts/paymob_setup_check.py` relative to this skill's root (`python skills/paymob-integration/scripts/paymob_setup_check.py` in a repository checkout). Resolve every failure without revealing any credential value.
 
 **Exit criteria for Phase 1:** merchant has Secret Key, Public Key, HMAC Secret, and at least one Integration ID (Test mode is enough to proceed). Then continue below.
 
@@ -138,7 +142,7 @@ Both branches share the same Phase 1 onboarding and the same Phase 3 testing —
 
 ## Phase 2A — Web/API Integration (Intention API + Unified Checkout)
 
-Read `references/intention-api.md` for the full request/response spec, field names, and error handling before writing code. Then use the **stack-specific code reference** that matches the merchant's backend (clean, copy-ready, correct interpolation and auth headers):
+Read `references/intention-api.md`, `references/integration-safety.md`, and `references/hmac-verification.md` before writing code. Then use the **stack-specific code reference** that matches the merchant's backend:
 
 | Stack | Reference file |
 |---|---|
@@ -152,11 +156,11 @@ Read `references/intention-api.md` for the full request/response spec, field nam
 Key shape of the flow:
 
 1. **Ask the merchant which payment methods to support** (Cards, Mobile Wallets, Apple/Google Pay, BNPL, Kiosk) if not already specified — each needs its own Integration ID from Phase 1 step 4.
-2. **Backend: Create a Payment Intention** — `POST` to the Intention endpoint with amount (in cents), currency, the Integration ID(s), items, billing_data, and your `notification_url` / `redirection_url`. Returns a `client_secret`. Send your own order id as `special_reference` so you can correlate the callback later.
+2. **Backend: Create a Payment Intention** — accept only an authenticated opaque checkout-session/order identifier from the browser. Load and lock the order, calculate amount/items/currency, choose the allowed Integration ID(s), and create an opaque payment-attempt reference on the server. `POST` those trusted values to the Intention endpoint and store the returned identifiers. Never trust browser-supplied price, currency, items, Integration IDs, tenant, or fulfillment target.
 3. **Frontend: Launch checkout** — redirect the customer to Paymob's **Unified Checkout**: `https://{base_url}/unifiedcheckout/?publicKey={PUBLIC_KEY}&clientSecret={client_secret}` (e.g. `https://accept.paymob.com/unifiedcheckout/?publicKey=pk_test_...&clientSecret=csk_test_...` for Egypt). See `references/intention-api.md` for the full breakdown and per-region base URLs.
 4. **Customer pays** — Paymob handles card entry, 3D Secure, wallet OTP, etc. You don't touch raw card data.
 5. **Backend: Handle the callback (webhook)** — Paymob POSTs the full transaction result to your `notification_url`. **This callback, not the redirect, is the source of truth for payment status.** Read `references/hmac-verification.md` and implement HMAC verification *before* trusting any callback data — reject/ignore any callback whose computed HMAC doesn't match.
-6. **Update order state atomically** after HMAC verification: insert `obj.id` under a unique constraint, compare-and-set the order state, and insert a uniquely keyed transactional outbox record in one database transaction. Use `order.id` / `special_reference` only for correlation; only the committed outbox worker triggers fulfillment.
+6. **Bind and update atomically** after HMAC verification: match the stored attempt's amount, currency, Integration ID, Paymob account/owner, mode, merchant reference, and known provider IDs. Classify auth/capture/refund/void/pending states correctly. Insert `obj.id` under a unique constraint, compare-and-set the order state, and insert a uniquely keyed fulfillment outbox record in one database transaction. Use `order.id` / `special_reference` only for correlation; only a completed sale/capture may enqueue fulfillment.
 7. **Add a Transaction Inquiry fallback.** Don't rely on the callback alone — read `references/transaction-inquiry.md` and add a way for the merchant's backend to actively pull a transaction/order's status. Use it for: orders stuck "pending" past an expected window, a periodic reconciliation job, and support/admin lookups. This uses a different auth flow (API Key → short-lived auth token) than the Intention API's Secret Key.
 
 Always implement HMAC verification — never mark an order paid based on the redirect URL alone, since redirect parameters are not authenticated.
@@ -184,17 +188,17 @@ Set the expectation that Mobile SDK integration takes longer (days–weeks) and 
 
 ## Phase 3 — Test the integration
 
-Before going live, validate the whole flow in sandbox using Paymob's test credentials:
+Before going live, follow the stage ladder in `references/sandbox-quickstart.md` using Paymob's test credentials:
 
 1. Confirm the merchant is using **Test mode** keys/Integration IDs (status must match between Secret Key and Integration ID, or you'll get a 404).
 2. Run through: create intention → checkout → pay with a test card → confirm callback fires → confirm HMAC verifies → confirm order updates.
 3. Use the test cards and wallet numbers in `references/test-credentials.md` to simulate success scenarios (decline/error simulation isn't officially documented by Paymob — confirm with the merchant if they need failure-path testing, and note that sandbox test data expires after 30 days).
-4. Have the merchant inspect the raw callback payload (log it) the first time, to confirm field names match what the code expects, then verify the HMAC matches manually against `references/hmac-verification.md` if anything looks off. The **Integration Wizard's HMAC validator / webhook tester** (`https://wizard.paymob.com/`) is handy for confirming your HMAC logic in isolation.
+4. Inspect the callback only through the official webhook tester or a controlled synthetic/test capture. In application logs, record only allowlisted metadata from `references/integration-safety.md`; never log the raw body, query string, keys, tokens, or customer data. Verify HMAC against the canonical fixture if anything looks off.
 5. Also exercise the Transaction Inquiry fallback (`references/transaction-inquiry.md`) during testing — generate an auth token, then look up the test transaction you just made by transaction ID/order ID, and confirm the merchant system can reconcile correctly if a callback were ever missed.
 6. **For Mobile SDK integrations (Phase 2B):** run through the same test cards inside the SDK's native checkout UI, on both a real device and simulator/emulator if possible, and confirm the backend callback (not just the SDK's in-app result) is what your test asserts on.
-7. **Kiosk and BNPL can't be tested in sandbox at all — don't block go-live on it.** Sandbox has no test path for them (`references/test-credentials.md`). That doesn't hold up launch: every method uses the same Intention API, the same Unified Checkout, and the same callback + HMAC verification, so a passing card test already validates effectively all of the merchant's own integration code. The merchant enables the remaining methods in the Dashboard and goes live. Four things a card test doesn't cover — check each on the **first real transaction** for each newly enabled method, not before:
+7. **Treat methods without a documented sandbox path as untested, not as covered by the card test.** `references/test-credentials.md` currently has no sandbox transaction for kiosk or BNPL. A passing card test validates much of the shared Intention/checkout/webhook path, but not method enablement, method-specific payload/state behavior, settlement timing, or refund support. Before broad live traffic, review the method configuration and run the smallest supported controlled live canary with the merchant's explicit approval, monitoring the verified callback and Inquiry result. Check:
    - **Integration ID** — each method has its own, and it must be enabled on this account in the matching mode. A wrong one fails loudly with 404 "Integration ID does not exist".
-   - **Callback field shape** — `references/hmac-verification.md` notes wallets and cards return slightly different nested shapes, and the HMAC concatenation includes the card-shaped `source_data.pan` / `source_data.sub_type` / `source_data.type`. Log the first real callback per method and confirm the computed HMAC still matches. If it doesn't, the callback is rejected and a genuinely paid order never completes — worth five minutes per method.
+   - **Callback field shape** — methods can return different nested values, while the HMAC concatenation still expects `source_data.pan` / `source_data.sub_type` / `source_data.type`. Confirm HMAC and schema using redacted structured diagnostics; never retain the complete callback.
    - **Kiosk settles asynchronously** — the customer pays cash at an outlet, so the callback can arrive hours or days after checkout, or never. Expect long-lived pending orders and rely on Transaction Inquiry (`references/transaction-inquiry.md`) instead of treating pending as failed.
    - **Refunds** — kiosk and most BNPL don't support them (`references/advanced-features.md`), so don't ship a refund path that assumes they do.
 8. Once the card flow passes end to end, the merchant can flip Dashboard to **Live mode** and swap in live keys/Integration IDs (same code, same base URL — only the keys/IDs change).
@@ -212,6 +216,7 @@ Before going live, validate the whole flow in sandbox using Paymob's test creden
 | Amount wrong by 100x | Amount must be in cents/piasters (10000 = 100.00 EGP) |
 | Checkout not rendering | Wrong `publicKey` (must be Public Key, not Secret) or stale/reused `client_secret` (it's single-use) |
 | Order stuck "pending" | Callback never arrived — use the Transaction Inquiry fallback (`references/transaction-inquiry.md`) |
+| Callback arrived but was quarantined | Signed data did not match the stored amount/currency/Integration ID/account/reference — follow `references/webhook-troubleshooting.md` |
 | Need a human / deeper help | Paymob developer community forum (`https://community.paymob.com/`) or `support@paymob.com` — see `references/live-resources.md` |
 
 ---
@@ -223,8 +228,13 @@ Before going live, validate the whole flow in sandbox using Paymob's test creden
 - `references/intention-api.md` — Create Intention endpoint, request/response fields, Unified Checkout redirect, common errors
 - `references/mobile-sdks.md` — Native mobile SDK flow (iOS/Android/Flutter/React Native), Hosted vs Embedded checkout, backend callback vs SDK result
 - `references/hmac-verification.md` — Callback payload, exact field order for HMAC, SHA-512 calculation, worked example
+- `references/integration-safety.md` — trusted order/amount derivation, callback business binding, lifecycle classification, safe logging, and application authorization
 - `references/transaction-inquiry.md` — Pull-based status checks (by order ID, transaction ID, or merchant order ID), reconciliation jobs, auth-token flow
 - `references/test-credentials.md` — Sandbox test cards, wallet numbers, OTPs
+- `references/credentials-and-integration-ids.md` — canonical dashboard paths, mode/region checks, and secret-safe handling
+- `references/sandbox-quickstart.md` — staged sandbox verification from configuration through reconciliation
+- `references/webhook-troubleshooting.md` — stage-based callback diagnosis and redacted escalation bundle
+- `references/payment-methods-and-features.md` — early routing for one-time/recurring payments, methods, saved cards, and advanced features
 
 **Ready-to-use code (corrected, copy-ready):**
 - `references/code-nodejs.md` — Node.js / TypeScript / Express / NestJS

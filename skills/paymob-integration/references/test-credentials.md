@@ -56,7 +56,7 @@ What that means in practice:
 2. Go through the real checkout flow (Unified Checkout redirect) and enter the test card / wallet details above as if you were the customer.
 3. Confirm:
    - The checkout reaches a success state.
-   - Your `notification_url` receives a POST callback (log the raw payload the first time).
+   - Your `notification_url` receives a POST callback. Use Paymob's webhook tester or redacted structured diagnostics; never log the raw payload.
    - Your HMAC verification (see `hmac-verification.md`) computes a match against the `hmac` query param.
    - Your order/database state updates correctly and idempotently.
 4. If you need to test 3D Secure or wallet OTP flows, the same test cards/numbers above are used — the sandbox will walk through the same UI prompts (3DS challenge, OTP entry) using the listed OTP/MPIN values.
